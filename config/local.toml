@@ -1,0 +1,13 @@
+token = "123456"
+
+[app]
+# hashStatecode
+rootURL = "http://localhost:19999"
+
+[server.http]
+port=9001
+
+[[cluster]]
+name = "saas"
+apiServer="https://xxxxx:6443"
+kubeConfig="./config/saas.json"
