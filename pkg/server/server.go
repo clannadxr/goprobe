@@ -8,6 +8,7 @@ import (
 	"github.com/gotomicro/ego/core/elog"
 	"github.com/gotomicro/ego/core/etrace"
 	"github.com/gotomicro/ego/server/egin"
+
 	"goprobe/pkg/dto"
 	"goprobe/pkg/pprof"
 )
@@ -33,6 +34,7 @@ func ServeHTTP() *egin.Component {
 		JSONOK(ctx, list)
 	})
 	router.GET("/graph", Graph)
+	router.GET("/pprof-list", GetPprofList)
 	return router
 }
 
@@ -50,6 +52,21 @@ func Graph(c *gin.Context) {
 		return
 	}
 	c.Data(http.StatusOK, "image/svg+xml", data)
+}
+
+func GetPprofList(c *gin.Context) {
+	var params dto.ReqGetPprofList
+	err := c.Bind(&params)
+	if err != nil {
+		JSONE(c, 1, "参数无效: "+err.Error(), nil)
+		return
+	}
+	data, err := pprof.Pprof.GetPprofList(params)
+	if err != nil {
+		JSONE(c, 1, "GetPprofList: "+err.Error(), nil)
+		return
+	}
+	JSONOK(c, data)
 }
 
 // JSONE 输出失败响应

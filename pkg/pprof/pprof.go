@@ -8,20 +8,24 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gotomicro/ego/core/econf"
-	"goprobe/pkg/dto"
-	"goprobe/pkg/kube"
-
 	"github.com/gotomicro/ego/core/elog"
 	"github.com/pkg/errors"
+	"github.com/spf13/cast"
 	torchPprof "github.com/uber-archive/go-torch/pprof"
 	"github.com/uber-archive/go-torch/renderer"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
+
+	"goprobe/pkg/dto"
+	"goprobe/pkg/kube"
+	"goprobe/pkg/storage"
+	"goprobe/pkg/storage/filesystem"
 )
 
 var profileTypes = []string{"block", "goroutine", "heap", "profile"}
@@ -33,11 +37,25 @@ const (
 
 var Pprof *pprof
 
-func init() {
-	Pprof = &pprof{}
+func Init() error {
+	// check path
+	basePath := econf.GetString("storage.filesystem.basePath")
+	err := os.MkdirAll(basePath, 0755)
+	if err != nil {
+		return fmt.Errorf("init pprof check dir failed: %w", err)
+	}
+	Pprof = &pprof{
+		storage: filesystem.NewFilesystemClient(basePath),
+	}
+	err = Pprof.checkEnv()
+	if err != nil {
+		return fmt.Errorf("init pprof check env failed: %w", err)
+	}
+	return nil
 }
 
 type pprof struct {
+	storage storage.Client
 }
 
 type PprofInfo struct {
@@ -54,14 +72,11 @@ func (p *pprof) GeneratePprof(reqRunProfile dto.ReqRunProfile) (list []PprofInfo
 			err = fmt.Errorf("pod_name or cluster_id cannot be empty")
 			return
 		}
-		UniqueKey := fmt.Sprintf("%s/%s/%d", reqRunProfile.Namespace, reqRunProfile.PodName, time.Now().Unix())
-		reqRunProfile.TempFileDir = fmt.Sprintf("./tmp/goprobe/pprof/%s", UniqueKey)
-
+		reqRunProfile.UniqueKey = fmt.Sprintf("%s/%s/%s_%d", reqRunProfile.ClusterName, reqRunProfile.Namespace, reqRunProfile.PodName, time.Now().UnixMilli())
 		if reqRunProfile.Port == 0 {
 			err = fmt.Errorf("治理端口未设置，请设置治理端口")
 			return
 		}
-
 		var targetClusterManager *kube.ClusterManager
 		targetClusterManager, err = kube.GetClusterManager(reqRunProfile.ClusterName)
 		if err != nil {
@@ -86,11 +101,11 @@ func (p *pprof) GeneratePprof(reqRunProfile dto.ReqRunProfile) (list []PprofInfo
 				}
 				list = append(list, PprofInfo{
 					Type: profileType,
-					Url:  getPprofUrl(profileType, UniqueKey, "flame"),
+					Url:  getPprofUrl(profileType, reqRunProfile.UniqueKey, "flame"),
 				})
 				list = append(list, PprofInfo{
 					Type: profileType,
-					Url:  getPprofUrl(profileType, UniqueKey, "profile"),
+					Url:  getPprofUrl(profileType, reqRunProfile.UniqueKey, "profile"),
 				})
 				return nil
 			})
@@ -105,10 +120,7 @@ func (p *pprof) GeneratePprof(reqRunProfile dto.ReqRunProfile) (list []PprofInfo
 			err = errors.New("addr cannot be empty")
 			return
 		}
-		UniqueKey := fmt.Sprintf("%s/%d", reqRunProfile.Addr, time.Now().Unix())
-
-		reqRunProfile.TempFileDir = fmt.Sprintf("./tmp/goprobe/pprof/%s", UniqueKey)
-
+		reqRunProfile.UniqueKey = fmt.Sprintf("%s/%s/%s_%d", reqRunProfile.ClusterName, "custom", reqRunProfile.Addr, time.Now().UnixMilli())
 		eg := errgroup.Group{}
 		for _, _profileType := range profileTypes {
 			profileType := _profileType
@@ -124,11 +136,11 @@ func (p *pprof) GeneratePprof(reqRunProfile dto.ReqRunProfile) (list []PprofInfo
 				}
 				list = append(list, PprofInfo{
 					Type: profileType,
-					Url:  getPprofUrl(profileType, UniqueKey, "flame"),
+					Url:  getPprofUrl(profileType, reqRunProfile.UniqueKey, "flame"),
 				})
 				list = append(list, PprofInfo{
 					Type: profileType,
-					Url:  getPprofUrl(profileType, UniqueKey, "profile"),
+					Url:  getPprofUrl(profileType, reqRunProfile.UniqueKey, "profile"),
 				})
 				return nil
 			})
@@ -140,22 +152,38 @@ func (p *pprof) GeneratePprof(reqRunProfile dto.ReqRunProfile) (list []PprofInfo
 		}
 		return
 	default:
-		err = fmt.Errorf("ProfileRunType (%d) isn't supported currently", reqRunProfile.Mode)
+		err = fmt.Errorf("ProfileRunType (%s) isn't supported currently", reqRunProfile.Mode)
 		return
 	}
 
 }
 func (p *pprof) FindGraphData(req dto.ReqPprofGraph) (data []byte, err error) {
-	tempFileDir := fmt.Sprintf("./tmp/goprobe/pprof/%s", req.Url)
-	svgPath := path.Join(tempFileDir, req.GoType+"_"+req.SvgType+".svg")
+	svgPath := filepath.Join(req.Url, req.GoType+"_"+req.SvgType+".svg")
 	// SVG
 	switch req.SvgType {
 	case "profile":
-		data, err = ioutil.ReadFile(svgPath)
+		fallthrough
 	case "flame":
-		data, err = ioutil.ReadFile(svgPath)
+		data, err = p.storage.GetBytes(context.TODO(), svgPath)
 	default:
 		return nil, fmt.Errorf("no exist svg type: " + req.SvgType)
+	}
+	return
+}
+
+func (p *pprof) GetPprofList(req dto.ReqGetPprofList) (list []dto.RespGetPprofListItem, err error) {
+	key := fmt.Sprintf("%s/%s", req.ClusterName, req.Namespace)
+	nameList, err := p.storage.List(context.TODO(), key)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range nameList {
+		n := strings.LastIndex(item, "_")
+		list = append(list, dto.RespGetPprofListItem{
+			Url:     fmt.Sprintf("%s/%s", key, item),
+			PodName: item[:n],
+			Ctime:   cast.ToInt64(item[n+1:]) / 1e3,
+		})
 	}
 	return
 }
@@ -171,6 +199,18 @@ func (p *pprof) checkEnv() (err error) {
 		return fmt.Errorf("there was an error running 'dot -v' command: %s", err)
 	}
 
+	// 3 check flamegraph.pl
+	flameGraphScripts := []string{"flamegraph", "flamegraph.pl", "./flamegraph.pl", "./FlameGraph/flamegraph.pl", "flame-graph-gen"}
+	var b bool
+	for _, v := range flameGraphScripts {
+		if _, err := exec.LookPath(v); err == nil {
+			b = true
+			break
+		}
+	}
+	if !b {
+		return errors.New("flameGraphScript not found")
+	}
 	return
 }
 
@@ -218,7 +258,7 @@ func (p *pprof) generateGraphByAddr(reqRunProfile dto.ReqRunProfile, pprofResNam
 		return
 	}
 
-	err = p.genSvg(rawProfileData, reqRunProfile.TempFileDir, pprofResName)
+	err = p.genSvg(rawProfileData, reqRunProfile.UniqueKey, pprofResName)
 	if err != nil {
 		err = fmt.Errorf("generateGraphByAddr err: %w", err)
 		return
@@ -254,7 +294,7 @@ func (p *pprof) generateGraphByK8S(reqRunProfile dto.ReqRunProfile, clusterManag
 		return
 	}
 	rawProfileData, _ := res.Raw()
-	err = p.genSvg(rawProfileData, reqRunProfile.TempFileDir, pprofResName)
+	err = p.genSvg(rawProfileData, reqRunProfile.UniqueKey, pprofResName)
 	if err != nil {
 		err = fmt.Errorf("generateGraphByK8S err: %w", err)
 		return
@@ -262,7 +302,8 @@ func (p *pprof) generateGraphByK8S(reqRunProfile dto.ReqRunProfile, clusterManag
 	return
 }
 
-func (p *pprof) genSvg(rawProfileData []byte, tmpFileDir string, pprofType string) (err error) {
+func (p *pprof) genSvg(rawProfileData []byte, uniqueKey string, pprofType string) (err error) {
+	tmpFileDir := filepath.Join(os.TempDir(), uniqueKey)
 	err = os.MkdirAll(tmpFileDir, os.ModePerm)
 	if err != nil {
 		err = errors.Wrap(err, "创建临时目录失败")
@@ -275,9 +316,16 @@ func (p *pprof) genSvg(rawProfileData []byte, tmpFileDir string, pprofType strin
 		err = errors.Wrap(err, "临时文件写入失败")
 		return
 	}
+	// 保存 bin 文件
+	err = p.storage.PutBytes(context.TODO(), filepath.Join(uniqueKey, pprofType+".bin"), rawProfileData)
+	if err != nil {
+		err = errors.Wrap(err, "临时文件保存失败")
+		return
+	}
 
 	var (
-		flameSvgByte []byte
+		flameSvgByte   []byte
+		profileSvgByte []byte
 	)
 
 	// 生成火焰图 SVG
@@ -287,19 +335,23 @@ func (p *pprof) genSvg(rawProfileData []byte, tmpFileDir string, pprofType strin
 		return
 	}
 
-	flameSvgPath := path.Join(tmpFileDir, pprofType+"_flame.svg")
-	err = ioutil.WriteFile(flameSvgPath, flameSvgByte, os.ModePerm)
+	err = p.storage.PutBytes(context.TODO(), filepath.Join(uniqueKey, pprofType+"_flame.svg"), flameSvgByte)
 	if err != nil {
-		err = errors.Wrap(err, "生成火焰图失败2")
+		err = fmt.Errorf("保存火焰图失败: %w", err)
 		return
 	}
 
 	// 生成Profile SVG
 	profileSvgPath := path.Join(tmpFileDir, pprofType+"_profile.svg")
-	_, err = p.generateProfileSvg(rawStorePath, profileSvgPath)
+	profileSvgByte, err = p.generateProfileSvg(rawStorePath, profileSvgPath)
 	if err != nil {
 		err = fmt.Errorf("生成Profile图失败, %w", err)
 		return
+	}
+
+	err = p.storage.PutBytes(context.TODO(), filepath.Join(uniqueKey, pprofType+"_profile.svg"), profileSvgByte)
+	if err != nil {
+		err = fmt.Errorf("保存 Profile 图失败: %w", err)
 	}
 	return nil
 }

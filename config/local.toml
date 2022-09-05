@@ -7,6 +7,11 @@ rootURL = "http://localhost:19999"
 [server.http]
 port=9001
 
+
+[storage]
+[storage.filesystem]
+basePath = "./tmp/goprobe/pprof"
+
 [[cluster]]
 name = "saas"
 apiServer="https://xxxxx:6443"

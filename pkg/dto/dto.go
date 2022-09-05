@@ -12,13 +12,24 @@ type (
 		Seconds     int    `form:"seconds" json:"seconds"`
 		Type        int    `form:"type"`
 		Token       string `form:"token"`
-		TempFileDir string
-		UniqueKey   string
+
+		UniqueKey string `form:"-" json:"-"`
 	}
 
 	ReqPprofGraph struct {
 		SvgType string `form:"svgType"` // flame | profile
 		GoType  string `form:"goType"`  // block | goroutine | heap | profile
 		Url     string `form:"url"`
+	}
+
+	ReqGetPprofList struct {
+		ClusterName string `form:"clusterName" binding:"required"`
+		Namespace   string `form:"namespace" binding:"required"`
+	}
+
+	RespGetPprofListItem struct {
+		Url     string `json:"url"`
+		PodName string `json:"podName"`
+		Ctime   int64  `json:"ctime"`
 	}
 )
